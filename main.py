@@ -200,39 +200,136 @@ async def root():
 @app.post("/grounded-answer")
 async def q3_answer(request: Request):
     body = await request.json()
-    question = body.get("question", "")
+
+    question = str(body.get("question", "")).strip()
     chunks = body.get("chunks", [])
-    prompt = (
-        "You are a highly reliable Grounded QA API for medical and legal compliance.\n"
-        "Your task is to answer the user's question strictly using ONLY the provided context chunks.\n"
-        "1. If the question CANNOT be answered from the chunks, you MUST return:\n"
-        "   - answerable: false\n"
-        "   - answer: \"I don't know\" (exact match)\n"
-        "   - citations: [] (empty array)\n"
-        "   - confidence: 0.1\n"
-        "2. If it CAN be answered, return:\n"
-        "   - answerable: true\n"
-        "   - answer: <your grounded answer>\n"
-        "   - citations: [<list of ONLY the chunk_ids you used>]\n"
-        "   - confidence: <float between 0.8 and 1.0>\n"
-        "NEVER use outside knowledge. Return strictly JSON with exactly these 4 keys.\n\n"
-        f"QUESTION:\n{question}\n\n"
-        f"CHUNKS:\n{json.dumps(chunks, indent=2)}"
-    )
-    try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=1000))
-        if not out.get("answerable", False) or out.get("confidence", 1.0) <= 0.3:
-            return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
-        valid_ids = [c["chunk_id"] for c in chunks]
-        cites = [c for c in out.get("citations", []) if c in valid_ids]
+
+    if not question or not isinstance(chunks, list) or len(chunks) == 0:
         return {
-            "answer": out.get("answer", "I don't know"),
-            "citations": cites,
-            "confidence": float(out.get("confidence", 0.9)),
-            "answerable": True
+            "answer": "I don't know",
+            "citations": [],
+            "confidence": 0.1,
+            "answerable": False
         }
+
+    valid_ids = {
+        c["chunk_id"]
+        for c in chunks
+        if isinstance(c, dict) and "chunk_id" in c
+    }
+
+    prompt = f"""
+You are a STRICT grounded QA engine.
+
+IMPORTANT RULES:
+
+1. Use ONLY the supplied chunks.
+
+2. NEVER use outside knowledge.
+
+3. If ANY part of the answer is missing from the chunks,
+return exactly
+
+{{
+"answer":"I don't know",
+"citations":[],
+"confidence":0.1,
+"answerable":false
+}}
+
+4. Cite ONLY chunk_ids that directly support the answer.
+
+5. Return ONLY JSON.
+
+Question:
+{question}
+
+Chunks:
+{json.dumps(chunks)}
+"""
+
+    try:
+        raw = await chat(
+            [{"role": "user", "content": prompt}],
+            model="gpt-4o",
+            max_tokens=500
+        )
+
+        out = parse_json(raw)
+
     except Exception:
-        return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+        return {
+            "answer":"I don't know",
+            "citations":[],
+            "confidence":0.1,
+            "answerable":False
+        }
+
+    answer = str(out.get("answer","")).strip()
+    citations = out.get("citations",[])
+    confidence = float(out.get("confidence",0.1))
+    answerable = bool(out.get("answerable",False))
+
+    if not isinstance(citations,list):
+        citations=[]
+
+    citations=[c for c in citations if c in valid_ids]
+
+    ####################################################
+    # STRICT VALIDATION
+    ####################################################
+
+    if (
+        not answerable
+        or answer.lower()=="i don't know"
+        or len(citations)==0
+    ):
+        return {
+            "answer":"I don't know",
+            "citations":[],
+            "confidence":0.1,
+            "answerable":False
+        }
+
+    supported_text=" ".join(
+        c["text"].lower()
+        for c in chunks
+        if c["chunk_id"] in citations
+    )
+
+    answer_words=[
+        w.lower()
+        for w in re.findall(r"[A-Za-z0-9]+",answer)
+        if len(w)>3
+    ]
+
+    matches=sum(
+        1
+        for w in answer_words
+        if w in supported_text
+    )
+
+    if len(answer_words)==0:
+        ratio=0
+    else:
+        ratio=matches/len(answer_words)
+
+    if ratio<0.55:
+        return {
+            "answer":"I don't know",
+            "citations":[],
+            "confidence":0.1,
+            "answerable":False
+        }
+
+    confidence=max(0.8,min(confidence,1.0))
+
+    return {
+        "answer":answer,
+        "citations":citations,
+        "confidence":confidence,
+        "answerable":True
+    }
 
 # ================= Q4: /vector-search =================
 def cosine_sim(a, b):
